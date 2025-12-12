@@ -149,11 +149,29 @@ async def main():
     print("Send commands like /num 9999999999 in that group.\n")
 
     await client.run_until_disconnected()
+# ---------- Keep Render Web Service Alive ----------
+from flask import Flask
+import threading
+
+web_app = Flask(__name__)
+
+@web_app.route("/")
+def home():
+    return "Telegram OSINT Bridge is running."
+
+def run_web():
+    web_app.run(host="0.0.0.0", port=10000)
+# ---------------------------------------------------
+
 
 
 if __name__ == "__main__":
+    # Start Flask server in background thread
+    threading.Thread(target=run_web, daemon=True).start()
+
     try:
         with client:
             client.loop.run_until_complete(main())
     except KeyboardInterrupt:
         print("\nStopped by user.")
+
