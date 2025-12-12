@@ -1,6 +1,3 @@
-asyncio
-time
-os
 datetime
 python-dotenv
 telethon
