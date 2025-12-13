@@ -1,44 +1,36 @@
 #!/usr/bin/env python3
 """
-Single-phase OSINT bridge using your user account (no bot).
+High-speed OSINT bridge using Telegram user account (Telethon).
 
-Flow:
-- Listen to SOURCE_GROUP_A for commands like /num 9999999999, /vehicle XX00YY1234, etc.
-- When a supported command is seen:
-    - Send the same command to TARGET_GROUP_B (Stark OSINT group).
-    - Wait WAIT_SECONDS.
-    - Find the reply in TARGET_GROUP_B that replies to that message.
-    - Send that reply back to SOURCE_GROUP_A as your account,
-      replying to the original command message.
-
-No Bot API is used, only Telegram API via Telethon with your own account.
+Features:
+- Multi-command parallel handling
+- Per-command async tracking
+- Event-based (no polling)
+- Ignores processing/searching messages
+- Returns only final OSINT data
 """
 
 import asyncio
 import os
 import time
 from datetime import datetime
-
+import threading
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from flask import Flask
 
-# ----------------- CONFIG -----------------
+# ================= CONFIG =================
 load_dotenv()
 
-API_ID = int(os.getenv("TG_API_ID") or 0)
-API_HASH = os.getenv("TG_API_HASH") or ""
-SESSION = os.getenv("TG_SESSION") or "stark_bridge.session"
+API_ID = int(os.getenv("TG_API_ID", "0"))
+API_HASH = os.getenv("TG_API_HASH", "")
+SESSION = os.getenv("TG_SESSION", "stark_bridge.session")
 
-# Group where commands are written (Group A)
-SOURCE_GROUP_A = os.getenv("SOURCE_GROUP_A") or "@YourSourceGroupA"
+SOURCE_GROUP_A = os.getenv("SOURCE_GROUP_A", "@YourSourceGroupA")
+TARGET_GROUP_B = os.getenv("TARGET_GROUP_B", "@YourStarkGroup")
 
-# Stark OSINT group (Group B)
-TARGET_GROUP_B = os.getenv("TARGET_GROUP_B") or "@YourStarkGroup"
+WAIT_SECONDS = float(os.getenv("WAIT_SECONDS", "15"))
 
-# How long to wait (in seconds) for a reply from Stark group
-WAIT_SECONDS = float(os.getenv("WAIT_SECONDS") or 7.0)
-
-# Supported commands (same style as your Stark network)
 COMMANDS = {
     "num": "Mobile Number Search",
     "num2": "Power Mobile Search",
@@ -52,107 +44,146 @@ COMMANDS = {
     "ifsc": "IFSC Code Lookup",
 }
 
+# =========================================
+
 client = TelegramClient(SESSION, API_ID, API_HASH)
-TARGET_GROUP_ENTITY = None  # set in main()
-# ------------------------------------------
+TARGET_GROUP_ENTITY = None
 
+# sent_msg_id -> tracking info
+pending_requests = {}
 
-async def send_to_stark_and_get_reply(command: str, value: str) -> str | None:
-    """
-    Sends '/command value' to Stark group and returns the first reply
-    that replies to that message. Returns None if not found in time.
-    """
-    global TARGET_GROUP_ENTITY
+# ---------- FILTERS ----------
+IGNORE_KEYWORDS = [
+    "searching",
+    "processing",
+    "extracting",
+    "please wait",
+    
+]
 
-    msg_text = f"/{command} {value}".strip()
-    sent = await client.send_message(TARGET_GROUP_ENTITY, msg_text)
-    sent_id = sent.id
+FINAL_HINT_KEYWORDS = [
+    "{", "name", "mobile", "address",
+    "upi", "pan", "dob", "vehicle", "ifsc","gst","rashan","username","telegram",
+    "boombing",
+]
 
-    # Wait some time for the bot to reply
-    await asyncio.sleep(WAIT_SECONDS)
+def is_final_reply(text: str) -> bool:
+    lower = text.lower()
+    if any(k in lower for k in IGNORE_KEYWORDS):
+        return False
+    return any(k in text for k in FINAL_HINT_KEYWORDS)
 
-    # Fetch recent messages in Stark group, find reply to our command
-    msgs = await client.get_messages(TARGET_GROUP_ENTITY, limit=30)
-    for m in msgs:
-        if getattr(m, "reply_to_msg_id", None) == sent_id:
-            return m.text or m.message
+# ---------- SEND COMMAND ----------
+async def send_command_to_stark(cmd, value, source_chat, source_msg_id):
+    msg = await client.send_message(
+        TARGET_GROUP_ENTITY,
+        f"/{cmd} {value}".strip()
+    )
 
-    return None
+    future = asyncio.get_running_loop().create_future()
 
+    pending_requests[msg.id] = {
+        "future": future,
+        "source_chat": source_chat,
+        "source_msg_id": source_msg_id,
+        "timestamp": time.time(),
+    }
 
-@client.on(events.NewMessage(chats=SOURCE_GROUP_A))
-async def handle_group_a_message(event: events.NewMessage.Event):
-    """
-    Triggered when a new message appears in Group A.
-    If it looks like a supported command, send to Stark group and pipe reply back.
-    """
-    text = (event.raw_text or "").strip()
-    if not text.startswith("/"):
-        return  # not a command
+    return future
 
-    parts = text.split(maxsplit=2)
-    if not parts:
+# ---------- HANDLE STARK REPLIES ----------
+@client.on(events.NewMessage(chats=TARGET_GROUP_B))
+async def handle_stark_reply(event):
+    msg = event.message
+    reply_id = getattr(msg, "reply_to_msg_id", None)
+    if not reply_id:
         return
 
-    cmd = parts[0].lstrip("/").lower()
+    if reply_id not in pending_requests:
+        return
+
+    text = (msg.text or msg.message or "").strip()
+    if not text:
+        return
+
+    if not is_final_reply(text):
+        return
+
+    data = pending_requests.pop(reply_id)
+    future = data["future"]
+
+    if not future.done():
+        future.set_result(text)
+
+# ---------- GROUP A COMMAND HANDLER ----------
+@client.on(events.NewMessage(chats=SOURCE_GROUP_A))
+async def handle_group_a_message(event):
+    text = (event.raw_text or "").strip()
+    if not text.startswith("/"):
+        return
+
+    parts = text.split(maxsplit=1)
+    cmd = parts[0][1:].lower()
+    value = parts[1] if len(parts) > 1 else ""
+
     if cmd not in COMMANDS:
-        return  # not one of our OSINT commands
+        return
 
-    # Extract value after the command
-    value = ""
-    if len(parts) >= 2:
-        value = parts[1].strip()
-        # If you need to support spaces in the value, use:
-        # value = " ".join(parts[1:]).strip()
+    print(f"[Group A] /{cmd} {value}")
 
-    query_msg = event.message
-    query_msg_id = query_msg.id
-    query_chat_id = query_msg.chat_id
+    future = await send_command_to_stark(
+        cmd,
+        value,
+        event.chat_id,
+        event.message.id
+    )
 
-    print(f"\n[Group A] Detected command: /{cmd} {value} (msg_id={query_msg_id})")
+    try:
+        result = await asyncio.wait_for(future, timeout=WAIT_SECONDS)
 
-    # Send to Stark and get reply
-    reply = await send_to_stark_and_get_reply(cmd, value)
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    if reply:
-        print(f"[{timestamp}] Reply received from Stark. Sending back to Group A...")
-        # Send back to Group A, replying to original command message
         await client.send_message(
-            entity=query_chat_id,
-            message=reply,
-            reply_to=query_msg_id,
+            entity=event.chat_id,
+            message=result,
+            reply_to=event.message.id,
         )
-    else:
-        print(f"[{timestamp}] No reply found in Stark within {WAIT_SECONDS} seconds.")
-        # Optionally notify in Group A that no reply was found:
-        # await client.send_message(
-        #     entity=query_chat_id,
-        #     message=f"No reply from Stark within {WAIT_SECONDS} seconds.",
-        #     reply_to=query_msg_id,
-        # )
 
+    except asyncio.TimeoutError:
+        await client.send_message(
+            entity=event.chat_id,
+            message="❌ No final response received from OSINT service.",
+            reply_to=event.message.id,
+        )
 
+# ---------- CLEANUP TASK ----------
+async def cleanup_expired_requests():
+    while True:
+        now = time.time()
+        expired = [
+            k for k, v in pending_requests.items()
+            if now - v["timestamp"] > WAIT_SECONDS
+        ]
+        for k in expired:
+            pending_requests.pop(k, None)
+        await asyncio.sleep(5)
+
+# ---------- MAIN ----------
 async def main():
     global TARGET_GROUP_ENTITY
 
-    print("Connecting as user account...")
+    print("Connecting Telegram client...")
     await client.start()
     me = await client.get_me()
-    print(f"Logged in as: {me.id} - {me.first_name}")
+    print(f"Logged in as {me.first_name} ({me.id})")
 
-    # Resolve Stark group entity once
     TARGET_GROUP_ENTITY = await client.get_entity(TARGET_GROUP_B)
-    print("Stark group resolved as:", TARGET_GROUP_ENTITY)
+    print("Target Stark group resolved.")
 
-    print(f"\nListening in SOURCE_GROUP_A = {SOURCE_GROUP_A}")
-    print("Send commands like /num 9999999999 in that group.\n")
+    asyncio.create_task(cleanup_expired_requests())
 
+    print("Bridge is running...")
     await client.run_until_disconnected()
-# ---------- Keep Render Web Service Alive ----------
-from flask import Flask
-import threading
 
+# ---------- KEEP ALIVE (RENDER) ----------
 web_app = Flask(__name__)
 
 @web_app.route("/")
@@ -161,17 +192,9 @@ def home():
 
 def run_web():
     web_app.run(host="0.0.0.0", port=10000)
-# ---------------------------------------------------
 
-
-
+# ---------- ENTRY ----------
 if __name__ == "__main__":
-    # Start Flask server in background thread
     threading.Thread(target=run_web, daemon=True).start()
-
-    try:
-        with client:
-            client.loop.run_until_complete(main())
-    except KeyboardInterrupt:
-        print("\nStopped by user.")
-
+    with client:
+        client.loop.run_until_complete(main())
