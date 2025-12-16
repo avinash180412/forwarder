@@ -58,6 +58,9 @@ IGNORE_KEYWORDS = [
     "processing",
     "extracting",
     "please wait",
+    "Database",
+    "searching mobile database...",
+    "searching upi database...,"
     
 ]
 
@@ -150,7 +153,7 @@ async def handle_group_a_message(event):
     except asyncio.TimeoutError:
         await client.send_message(
             entity=event.chat_id,
-            message="❌ No final response received from OSINT service.",
+            message="❌ No final response received from SHADOW OSINT NETWORK.",
             reply_to=event.message.id,
         )
 
