@@ -61,7 +61,8 @@ IGNORE_KEYWORDS = [
     "Database",
     "searching mobile database...",
     "searching upi database...,"
-    
+    "No result found",
+    "Result not found"
 ]
 
 FINAL_HINT_KEYWORDS = [
@@ -76,7 +77,9 @@ def is_final_reply(text: str) -> bool:
         return False
     return any(k in text for k in FINAL_HINT_KEYWORDS)
 
-# ---------- SEND COMMAND ----------
+ORDS)
+
+# ---------- SEND COMMAND ---
 async def send_command_to_stark(cmd, value, source_chat, source_msg_id):
     msg = await client.send_message(
         TARGET_GROUP_ENTITY,
